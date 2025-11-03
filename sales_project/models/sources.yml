@@ -1,0 +1,13 @@
+version: 2
+
+sources:
+  - name: redshift
+    database: dev
+    schema: public
+    tables:
+      - name: vw_sales_data
+      - name: customer
+      - name: supplier
+      - name: part
+      - name: dwdate
+      - name: lineorder

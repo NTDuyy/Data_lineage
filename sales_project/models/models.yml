@@ -1,0 +1,26 @@
+version: 2
+
+models:
+  - name: stg_sales_data
+    description: "A staging model that joins customer, supplier, part, and date with lineorder to create a clean sales dataset."
+    columns:
+      - name: customer_name
+        description: "Name of the customer placing the order."
+      - name: supplier_name
+        description: "Supplier providing the product."
+      - name: product_name
+        description: "Product sold in the order."
+      - name: revenue
+        description: "Revenue from the sale."
+      - name: order_date
+        description: "Date when the order was placed."
+
+  - name: fact_sales_summary
+    description: "Aggregated monthly revenue per supplier."
+    columns:
+      - name: supplier_name
+        description: "Supplier providing the product."
+      - name: month
+        description: "Month of the order."
+      - name: total_revenue
+        description: "Total revenue for each supplier and month."
