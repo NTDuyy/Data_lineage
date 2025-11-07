@@ -12,21 +12,13 @@ Key features include:
 ---
 
 ## 🗂 Project Structure
-Data_lineage/
-├── DataLineageAPI/
-├── Redshift Database/
-├── notebook/
-├── sales_project/
-├── requirements.txt
-└── README.md
-
 ### Folder Details
 
 - **DataLineageAPI/**  
-  FastAPI providing upstream/downstream lineage endpoints.
+  Connector scripts and API layer for extracting metadata from Redshift and dbt.
 
 - **Redshift Database/**  
-  SQL scripts for extracting metadata (stored procedures, dependencies, table usage, etc.).
+  Redshift initialization script for our project.
 
 - **notebook/**  
   Jupyter notebooks for analysis, visualization, and lineage documentation.
