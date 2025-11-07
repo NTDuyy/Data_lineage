@@ -3,6 +3,10 @@ import subprocess
 from pathlib import Path
 from neo4j import GraphDatabase
 
+import sqlglot
+from sqlglot import parse_one, exp
+
+import boto3
 import psycopg2
 import pandas as pd
 
@@ -27,34 +31,95 @@ RED_SHIFT_USER = os.getenv("RED_SHIFT_USER")
 RED_SHIFT_PASSWORD = os.getenv("RED_SHIFT_PASSWORD")
 RED_SHIFT_SCHEMA = os.getenv("RED_SHIFT_SCHEMA")
 
+def safe_name(part):
+    """Return cleaned identifier whether it's a string or AST node."""
+    if part is None:
+        return None
+    if hasattr(part, "sql"):
+        return part.sql().replace('"', '')
+    return str(part).replace('"', '')
+
+
+def extract_source_from_sql(sql):
+    ast = parse_one(sql)
+
+    # --- 1. Extract tables including DB + schema ---
+    alias_to_table = {}
+
+    for table in ast.find_all(exp.Table):
+
+        alias = table.alias or table.name
+
+        db = safe_name(table.catalog)  
+        schema = safe_name(table.db)  
+        name = safe_name(table.name)
+
+        parts = [p for p in [db, schema, name] if p]
+        full_name = ".".join(parts)
+
+        alias_to_table[alias] = full_name
+
+    # --- 2. SELECT list ---
+    select_exprs = ast.selects
+
+    # --- 3. Handle GROUP BY numeric indexes ---
+    group_positions = []
+    if ast.args.get("group"):
+        for g in ast.args["group"].expressions:
+            if isinstance(g, exp.Literal) and g.is_int:
+                group_positions.append(int(g.this) - 1)
+
+    # --- 4. Build lineage ---
+    column_lineage = {}
+
+    for i, sel in enumerate(select_exprs):
+        # Target column name
+        if isinstance(sel, exp.Alias):
+            target = sel.alias
+            expr = sel.this
+        else:
+            target = sel.sql()
+            expr = sel
+
+        # Extract all source columns used within the expression
+        source_cols = list(expr.find_all(exp.Column))
+
+        sources = []
+        for col in source_cols:
+            alias = col.table or list(alias_to_table.keys())[0]  # fallback
+            sources.append({
+                "table": alias_to_table.get(alias, alias),
+                "column": col.name
+            })
+
+        column_lineage[target] = sources
+
+    return column_lineage
+
+
 
 class DbtSourceConnector:
-    def __init__(self, dbt_project_path = DBT_PROJECT_PATH, neo4j_uri=NEO4J_URI, neo4j_user=NEO4J_USERNAME, neo4j_password=NEO4J_PASSWORD):
+    def __init__(self, dbt_project_path, neo4j_uri=NEO4J_URI, neo4j_user=NEO4J_USERNAME, neo4j_password=NEO4J_PASSWORD):
         self.project_path = Path(dbt_project_path)
         self.driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
 
     def compile_dbt_model(self):
         MODELS_PATH = self.project_path / "models"
         sql_files = list(MODELS_PATH.rglob("*.sql"))
-        print(f"Found {len(sql_files)} model(s) to compile.")
     
-        for sql_file in sql_files:
-            relative_path = sql_file.relative_to(self.project_path)
-            print(f"Compiling {relative_path} ...")
     
-            result = subprocess.run(
-                ["dbt", "compile", "--select", str(relative_path)],
-                cwd=self.project_path,
-                capture_output=True,
-                text=True
-            )
+        result = subprocess.run(
+            ["dbt", "compile"],
+            cwd=self.project_path,
+            capture_output=True,
+            text=True
+        )
     
-            if result.returncode != 0:
-                print(f"❌ Error compiling {relative_path}:")
-                print(result.stderr)
-                continue
-    
-            print(f"✅ Compiled {relative_path}")
+        if result.returncode != 0:
+            print(f"❌ Error compiling dbt project")
+            print(result.stderr)
+        else:
+            print(f"✅ Compiled dbt project")
             print(result.stdout)
 
     def load_manifest(self):
@@ -147,7 +212,69 @@ class DbtSourceConnector:
                     db_name=rel["db_name"],
                     source=rel["source_name"]
                 )
-    
+            
+        def create_column_nodes(tx, db_name, schema, table_name, name):
+            """
+            Create or merge a Column node.
+            """
+            tx.run(
+                """
+                MERGE (c:Column {
+                    id: $id
+                })
+                SET c.name = $column_name,
+                    c.table_name = $table_name,
+                    c.schema = $schema_name,
+                    c.db_name = $db_name
+                """,
+                id=f"{db_name}.{schema}.{table_name}.{name}",
+                column_name=name,
+                table_name=table_name,
+                schema_name=schema,
+                db_name = db_name
+            )
+
+
+        def create_column_relationships(tx, source_dbname, source_schema, source_table, source_col, target_dbname, target_schema, target_table, target_col, source):
+            """
+            Create lineage between columns:
+                (source_column) -[:TRANSFORMED_TO]-> (target_column)
+            """
+            tx.run(
+                """
+                MATCH (src:Column {id: $source_id})
+                MATCH (tgt:Column {id: $target_id})
+                MERGE (src)-[:TRANSFORMED_TO]->(tgt)
+                """,
+                source_id=f"{source_dbname}.{source_schema}.{source_table}.{source_col}",
+                target_id=f"{target_dbname}.{target_schema}.{target_table}.{target_col}"
+            )
+
+            tx.run(
+                    """
+                    MATCH (m:Column {id: $source_id})
+                    MERGE (t:Table {name: $source_table, schema: $source_schema, db_name: $source_dbname, source: $source})
+                    MERGE (m)-[:BELONGS_TO]->(t)
+                    """,
+                    source_table=source_table,
+                    source_schema=source_schema,
+                    source_dbname=source_dbname,
+                    source_id=f"{source_dbname}.{source_schema}.{source_table}.{source_col}",
+                    source=source
+                )
+            tx.run(
+                    """
+                    MATCH (m:Column {id: $target_id})
+                    MERGE (t:Table {name: $target_table, schema: $target_schema, db_name: $target_dbname, source: $source})
+                    MERGE (m)-[:BELONGS_TO]->(t)
+                    """,
+                    target_table=target_table,
+                    target_schema=target_schema,
+                    target_dbname=target_dbname,
+                    target_id=f"{target_dbname}.{target_schema}.{target_table}.{target_col}",
+                    source=source
+                )
+
         # --- Prepare data ---
         model_records = []
         source_records = set()
@@ -158,7 +285,52 @@ class DbtSourceConnector:
         for model_id, model_data in nodes.items():
             if model_data.get("resource_type") != "model":
                 continue  # skip tests, macros, etc.
-    
+            # Extract columns and their source
+            column_source = extract_source_from_sql(model_data["compiled_code"])
+            
+            for output_column, sources in column_source.items():
+                with self.driver.session() as session:
+                    # Create target (output) column node
+                    session.execute_write(
+                        create_column_nodes,
+                        model_data["database"],
+                        model_data["schema"],
+                        model_id.split(".")[-1],
+                        output_column
+                    )
+
+                    # Create source columns + relationships
+                    for related_col in sources:
+                        src_table_parts = related_col["table"].split(".")
+                        src_table = src_table_parts[2]
+                        src_schema = src_table_parts[1]
+                        src_dbname = src_table_parts[0]
+                        src_column = related_col["column"]
+
+                        # Create source column node
+                        session.execute_write(
+                            create_column_nodes,
+                            src_dbname,
+                            src_schema,
+                            src_table,
+                            src_column
+                        )
+
+                        # Create lineage relationship
+                        session.execute_write(
+                            create_column_relationships,
+                            src_dbname,
+                            src_schema,
+                            src_table,
+                            src_column,
+                            model_data["database"],
+                            model_data["schema"],
+                            model_id.split(".")[-1],
+                            output_column,
+                            source_name
+                        )
+
+
             config = model_data.get("config", {})
             materialized = config.get("materialized", "table")
             relation_name = model_data.get("relation_name")  # physical table/view if exists
@@ -222,11 +394,8 @@ class DbtSourceConnector:
     
         print("✅ Metadata successfully imported into Neo4j.")
 
-
 class RedshiftSourceConnector():
-    def __init__(self, client_type = RED_SHIFT_CLIENT_TYPE
-                 , region_name = RED_SHIFT_REGION_NAME
-                 , host = RED_SHIFT_HOST
+    def __init__(self, host = RED_SHIFT_HOST
                  , username = RED_SHIFT_USER
                  , password = RED_SHIFT_PASSWORD
                  , db_name = RED_SHIFT_DBNAME
@@ -309,12 +478,18 @@ class RedshiftSourceConnector():
     
         return pd.DataFrame(rows, columns=columns)
 
-    def load_tables_and_relationships(self):
+    def import_metadata_neo4j(self):
         def create_nodes(tx, rows):
             for _, row in rows.iterrows():
+                # Create Table node (once per row)
                 tx.run(
                     """
-                    MERGE (t:Table {name: $table_name, schema: $schema_name, db_name: $db_name, source: 'redshift'})
+                    MERGE (t:Table {
+                        name: $table_name,
+                        schema: $schema_name,
+                        db_name: $db_name,
+                        source: 'redshift'
+                    })
                     SET t.object_type = $object_type
                     """,
                     table_name=row["table_name"],
@@ -322,23 +497,32 @@ class RedshiftSourceConnector():
                     db_name=self.db_name,
                     object_type=row["object_type"]
                 )
+
+                # Create Column node and relationship
                 tx.run(
                     """
-                    MERGE (t:Table {name: $table_name, schema: $schema_name, source: 'redshift'})
-                    MERGE (c:Column {name: $column_name, table_name: $table_name, schema: $schema_name})
-                    SET c.data_type = $data_type,
+                    MERGE (c:Column {id: $id})
+                    SET c.name = $column_name,
+                        c.table_name = $table_name,
+                        c.schema = $schema_name,
+                        c.db_name = $db_name,
+                        c.data_type = $data_type,
                         c.is_nullable = $is_nullable,
                         c.constraint_type = $constraint_type,
                         c.constraint_name = $constraint_name
+                    WITH c
+                    MATCH (t:Table {name: $table_name, schema: $schema_name, db_name: $db_name, source: 'redshift'})
                     MERGE (c)-[:BELONGS_TO]->(t)
                     """,
+                    id=f"{self.db_name}.{row['schema_name']}.{row['table_name']}.{row['column_name']}",
                     column_name=row["column_name"],
                     table_name=row["table_name"],
                     schema_name=row["schema_name"],
                     data_type=row["data_type"],
                     is_nullable=row["is_nullable"],
                     constraint_type=row["constraint_type"],
-                    constraint_name=row["constraint_name"]
+                    constraint_name=row["constraint_name"],
+                    db_name=self.db_name
                 )
 
         def create_foreign_key_relationships(tx, rows):
